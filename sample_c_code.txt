@@ -1,0 +1,1169 @@
+
+#include "stdio.h"
+#include "math.h"
+#include "time.h"
+#include "stdlib.h"
+#include "evmdm6437.h"
+#include "evmdm6437_led.h"
+#include "aic33_functions.h"
+#include "evmdm6437_aic33.h"
+#include "evmdm6437_dip.h"
+
+/////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////
+//         DON'T change the following setting for EDMA         //
+/////////////////////////////////////////////////////////////////
+/* EDMA Registers for 6437*/
+#define		PaRAM_OPT	0	// Channel Options Parameter
+#define		PaRAM_SRC	1	// Channel Source Address
+#define		PaRAM_BCNT	2	// Count for 2nd Dimension (BCNT) | Count for 1st Dimension (ACNT)
+#define		PaRAM_DST	3	// Channel Destination Address
+#define		PaRAM_BIDX	4	// Destination BCNT Index | Source BCNT Index
+#define		PaRAM_RDL	5	// BCNT Reload (BCNTRLD) | Link Address (LINK)
+#define		PaRAM_CIDX	6	// Destination CCNT Index | Source CCNT Index
+#define		PaRAM_CCNT	7	// Count for 3rd Dimension (CCNT)
+
+/* EDMA Registers for 6437*/
+#define		EDMA_IPR	*(volatile int *)0x01C01068	// EDMA Channel interrupt pending low register
+#define		EDMA_IPRH	*(volatile int *)0x01C0106C	// EDMA Channel interrupt pending high register
+#define		EDMA_IER	*(volatile int *)0x01C01050	// EDMA Channel interrupt enable low register
+#define		EDMA_IERH	*(volatile int *)0x01C01054	// EDMA Channel interrupt enable high register
+#define		EDMA_ER 	*(volatile int *)0x01C01000	// EDMA Event low register
+#define		EDMA_ERH	*(volatile int *)0x01C01004	// EDMA Event high register
+#define		EDMA_EER	*(volatile int *)0x01C01020	// EDMA Event enable low register
+#define		EDMA_EERH	*(volatile int *)0x01C01024	// EDMA Event enable high register
+#define		EDMA_ECR	*(volatile int *)0x01C01008	// EDMA Event clear low register
+#define		EDMA_ECRH	*(volatile int *)0x01C0100C	// EDMA Event clear high register
+#define		EDMA_ESR	*(volatile int *)0x01C01010	// EDMA Event set low register
+#define		EDMA_ESRH	*(volatile int *)0x01C01014	// EDMA Event set high register
+/////////////////////////////////////////////
+
+extern far cregister volatile unsigned int IER;
+extern far cregister volatile unsigned int CSR;
+extern far cregister volatile unsigned int ICR;
+extern far cregister volatile unsigned int ISTP;
+extern far cregister volatile unsigned int ISR;
+extern far cregister volatile unsigned int IFR;
+
+/////////////////////////////////////////////////////////////////
+
+extern Int16 video_loopback_test();
+
+// size for buffer_in: 720 * 480 / 2, the reason is explained below. 
+#define Pixels 172800
+
+// Resolution 720 * 480 (NTSC mode)
+#define vWidth 720
+#define vHeight 480
+
+// CAN change the internal blocksize here, the example is 60 * 120
+#define INTERNAL_BLK_WIDTH 60
+#define INTERNAL_BLK_HEIGHT 120
+
+/////////////////////////////////////////////////////////////////////
+unsigned char flag=0;
+AIC33_CodecHandle aic33handle;
+Int32 sample_data = 0;
+Int16 dip0, dip1;
+Int16 curDip = 10;
+/////////////////////////////////////////////////////////////////////
+
+// Define a space on memory for save the information input and output (Interface data)
+Uint32 buffer_out[Pixels]; //from 0x80000000
+Uint32 buffer_in[Pixels]; //from 0x800A8C00, which is the same as 4 (bytes for integer) * Pixels
+int blah[172800];
+
+// Declare the internal buffer 
+Uint32 internal_buffer_2D[INTERNAL_BLK_HEIGHT][INTERNAL_BLK_WIDTH / 2];
+
+
+// Define the position of the data (refer to linker.cmd)
+// Internal memory L2RAM ".l2ram" 
+// External memory DDR2 ".ddr2"
+#pragma DATA_SECTION(buffer_out,".ddr2")
+#pragma DATA_SECTION(buffer_in,".ddr2")
+#pragma DATA_SECTION(Buffer_input, ".ddr2")
+#pragma DATA_SECTION(blah, ".ddr2")
+
+// buffer_in represents one input frame which consists of two interleaved frames.
+// Each 32 bit data has the information for two adjacent pixels in a row.
+// Thus, the buffer holds 720/2 integer data points for each row of 2D image and there exist 480 rows.
+//
+// Format: yCbCr422 ( y1 | Cr | y0 | Cb )
+// Each of y1, Cr, y0, Cb has 8 bits
+// For each pixel in the frame, it has y, Cb, Cr components
+//
+// You can generate a lookup table for color conversion if you want to convert to different color space such as RGB.
+// Could refer to http://www.fourcc.org/fccyvrgb.php for conversion between yCbCr and RGB
+// 
+
+// Drum synthesis parameters
+int len = 5000; // number of samples per drum sound
+int pulselen = 400; // length of constant pulse (fed through comb filter)
+int delay_in = 425;
+short gainL = 100; // should be between 1-100
+short gainR = 100; // should be between 1-100
+double alpha_in = 0.99;
+Int16 audio_buffer[426]; // set length to delay+1
+int playReady = 0;
+int playCnt = 0;
+
+// Kalman filtering variables
+float t=0; //time
+float dt=.5;//set time increments
+float Xt[4][1]= {494, 256, 1, 1};
+float XtR[4][1]= {494, 256, 1, 1};
+float P[4][4];
+float PR[4][4];
+float eye[4][4];
+float Q[4][4];
+float QR[4][4];
+float R[2][2]={{1,.02},{.02, 1}}; //minimal innovative covariance
+float H[2][4]={{1, 0, 0, 0}, {0, 1, 0, 0}};//Measurement value
+float F[4][4]={{1, 0, 0, 0},{0, 1, 0, 0},{0, 0, 1, 0}, {0, 0, 0, 1}}; //innovative step
+int U=0;
+float readx=0;
+float readxR=0;
+float ready=0;
+float readyR=0;
+float xt_tm1[4][1];
+float xt_tm1R[4][1];
+float Pt_tm1[4][4];
+float Pt_tm1R[4][4];
+float z1[2][1];
+float z1R[2][1];
+float zt[2][1];
+float ztR[2][1];
+float Resy[2][1];
+float ResyR[2][1];
+float S[2][2];
+float SR[2][2];
+float K[4][2];
+float KR[4][2];
+//P already defined
+float buffer[4][4];
+float bufferR[4][4];
+float buffer2[4][4];
+float buffer2R[4][4];
+float Htranspose[4][2]={{1, 0},{0, 1},{0, 0},{0, 0}};
+float Ftranspose[4][4];
+float sum=0;
+float sumR=0;
+int hit=0;
+int hitR=0;
+int NewL=0;
+int NewR=0;
+int countR=0;
+int countL=0;
+
+
+// Recently Added
+int threshold=0;
+int prevspeed=0;
+int actualhit;
+int actualhitR;
+int prevhit2=0;
+int prevhit3=0;
+int prevhit2R;
+int prevhit3R;
+float previousyspeed;
+float previousyspeedR;
+float currentyspeed;
+float currentyspeedR;
+float predictY;
+float predictYR;
+
+
+// Using EDMA, copy data from input buffer in the external memory to internal buffer in the internal memory.
+void BlockProcessingEDMA(void){
+	int i;
+	int blkIdx, blkNum = 0;
+	int *Event1, *Event2;
+
+	// DON'T change the following setting except the source and destination address
+	// Event[PaRAM_SRC] is the source data
+	// Event[PaRAM_DST] is the destination data
+	//
+	// Setup a channel for EDMA transfer from External to Internal
+	Event1			 = (int *)(0x01C04000 + 32 * 9);
+	Event1[PaRAM_OPT] = 0x0010000C;
+	Event1[PaRAM_SRC] = (int)buffer_in;				// Source address
+	Event1[PaRAM_BCNT]= ((INTERNAL_BLK_HEIGHT) << 16) | (INTERNAL_BLK_WIDTH/2 * 4);
+	Event1[PaRAM_DST] = (int)internal_buffer_2D;  	// Destination address
+	Event1[PaRAM_BIDX]= ((INTERNAL_BLK_WIDTH/2 * 4) << 16) | (vWidth/2 * 4);
+	Event1[PaRAM_RDL] = 0x0000FFFF;
+	Event1[PaRAM_CIDX]= 0x00000000;
+	Event1[PaRAM_CCNT]= 0x00000001;
+	
+	// Setup a channel for EDMA transfer from Internal to External
+	Event2 			 = (int *)(0x01C04000 + 32 * 10);
+	Event2[PaRAM_OPT] = 0x0010000C;
+	Event2[PaRAM_SRC] = (int)internal_buffer_2D;	// Source address
+	Event2[PaRAM_BCNT]= ((INTERNAL_BLK_HEIGHT) << 16) | (INTERNAL_BLK_WIDTH/2 * 4); 
+	Event2[PaRAM_DST] = (int)buffer_out;  			// Destination address
+	Event2[PaRAM_BIDX]= ((vWidth/2 * 4) << 16) | (INTERNAL_BLK_WIDTH/2 * 4);
+	Event2[PaRAM_RDL] = 0x0000FFFF;
+	Event2[PaRAM_CIDX]= 0x00000000;
+	Event2[PaRAM_CCNT]= 0x00000001;
+	
+	/* Block-based processing */
+	blkNum = vHeight * vWidth / (INTERNAL_BLK_WIDTH * INTERNAL_BLK_HEIGHT); // Total number of blocks
+	// 'blkIdx' indicates the index of block you're processing.
+	// The block with zero 'blkIdx' is the block at the top-left corner.
+	// The following code retrives the blocks in the same order of raster scan.  
+	for(blkIdx = 0; blkIdx < blkNum; ++blkIdx)
+	{
+		
+		// DON'T change the following setting
+		// DMA transfer of a block from external memeory to internal memrory
+		Event1[PaRAM_SRC] = (int)( &buffer_in[(blkIdx%(vWidth / INTERNAL_BLK_WIDTH)) * INTERNAL_BLK_WIDTH/2 + ((int)(blkIdx / (vWidth / INTERNAL_BLK_WIDTH))) * vWidth/2 * INTERNAL_BLK_HEIGHT]);
+		for(i=0;i<500;i++)
+			if(EDMA_IPR&0x400 == 0) break; // Waiting for EDMA channel 10 transfer complete		
+		EDMA_IPR = 0x200;             // Clear CIP9
+		EDMA_ESR = EDMA_ESR | 0x200;    // Start channel 9 EDMA transfer
+
+		// Do your processing based on the blocks in internal memory
+		// CAN change the size of blocks (check the DEFINE statement at the beginning of this file)
+		//
+	
+	
+		// DON'T change the following setting
+		// DMA transfer of a block from internal memeory to external memrory
+		Event2[PaRAM_DST] = (int)( &buffer_out[(blkIdx%(vWidth / INTERNAL_BLK_WIDTH)) * INTERNAL_BLK_WIDTH/2 + ((int)(blkIdx / (vWidth / INTERNAL_BLK_WIDTH))) * vWidth/2 * INTERNAL_BLK_HEIGHT] );
+		for(i=0;i<500;i++)
+			if(EDMA_IPR&0x200 == 0) break; // Waiting for EDMA channel 9 transfer complete		
+
+		EDMA_IPR = 0x400;              // Clear CIP10
+		EDMA_ESR = EDMA_ESR | 0x400;    // Start channel 10 EDMA transfer
+	}
+}
+
+
+// Using EDMA, copy data from input buffer to output buffer; both on the external memory
+void DirectTransferEDMA(void){
+	int i;
+	int *Event;
+
+	// DON'T change the following setting except the source and destination address
+	// Event[PaRAM_SRC] is the source data
+	// Event[PaRAM_DST] is the destination data
+	// Direct copy from External to External
+	Event			 = (int *)(0x01C04000 + 32 * 9);
+	Event[PaRAM_OPT] = 0x0010000C;
+	Event[PaRAM_SRC] = (int)buffer_in;			// Source address
+	Event[PaRAM_BCNT]= ((vHeight) << 16) | (vWidth/2 * 4);
+	Event[PaRAM_DST] = (int)buffer_out;  	// Destination address
+	Event[PaRAM_BIDX]= ((vWidth/2 * 4) << 16) | (vWidth/2 * 4);
+	Event[PaRAM_RDL] = 0x0000FFFF;  //
+	Event[PaRAM_CIDX]= 0x00000000;
+	Event[PaRAM_CCNT]= 0x00000001;
+	
+	// DON'T change the following setting
+	for(i = 0; i < 500; i++) 
+		if(EDMA_IPR & 0x200) break; // Waiting for EDMA channel 9 transfer complete	
+	EDMA_IPR = 0x200;             // Clear CIP9
+	EDMA_ESR = EDMA_ESR | 0x200;    // Start channel 9 EDMA transfer
+}
+
+void FillMatrices(void){
+	int i=0;
+	int j=0;
+	//Initialization of P matrix as identity matrix
+	for (i=0; i<4; i++){
+		for(j=0; j<4; j++){
+			if(i==j){
+				P[i][j]=1;
+				PR[i][j]=1;
+				eye[i][j]=1;
+			}
+			else{
+				P[i][j]=0;
+				PR[i][j]=0;
+				eye[i][j]=0;
+			}
+			
+		}
+	}
+	
+	for (i=0; i<4; i++){
+		for(j=0; j<4; j++){
+			if(i==j){
+				Q[i][j]=1;
+				QR[i][j]=1;
+			}
+			else{
+				Q[i][j]=.02;
+				QR[i][j]=.02;
+			}
+			
+		}
+	}
+	
+	F[0][2]=dt;
+	F[1][3]=dt;
+	
+	for(i = 0; i< Pixels; i++){
+		
+		blah[i] = 1;
+	}
+}
+
+
+// Synthesize and play drum sound
+void synthesize_drum(double alpha, int delay, short gain) {
+    
+    // declare variables
+    int i, ind_i, ind_ip1; // iteration and index variables
+    Int16 eff_gain, tempsamp, prevsamp, prevsamp2, currsamp;
+    
+    eff_gain = 1000 - 10*(100-gain);
+    
+    // Set initial conditions
+    for (i=0; i<pulselen; i++) {
+        audio_buffer[i] = eff_gain; // constant pulse wavetable
+        // audio_buffer[i] = rand()%(2*gain) - gain; // random wavetable
+        EVMDM6437_AIC33_write16( aic33handle, audio_buffer[i] );
+    }
+    
+    for (i=pulselen; i<delay; i++) {
+        audio_buffer[i] = 0;
+        EVMDM6437_AIC33_write16( aic33handle, 0 );
+    }
+    
+    audio_buffer[delay] = (Int16) floor(eff_gain*alpha/2);
+    prevsamp = audio_buffer[delay];
+    prevsamp2 = 0;
+    
+    // Probabilistic comb filter
+    for (i=0; i<(len-delay-1); i++) {
+        ind_i = i%(delay+1);
+        ind_ip1 = (i+1)%(delay+1);
+        
+        if ( rand()%2 ) {
+            // tempsamp = (Int16) floor(alpha/2*(audio_buffer[ind_ip1] + audio_buffer[ind_i]));
+            tempsamp = (Int16) floor(alpha*(audio_buffer[ind_ip1] + audio_buffer[ind_i])) >> 1;
+        }
+        else {
+            // tempsamp = (Int16) floor(alpha/2*(audio_buffer[ind_ip1] - audio_buffer[ind_i]));
+            tempsamp = (Int16) floor(alpha*(audio_buffer[ind_ip1] + audio_buffer[ind_i])) >> 1;
+        }
+        
+        // Moving average filter
+        // currsamp = (tempsamp + prevsamp) >> 1;       
+        currsamp = (tempsamp + prevsamp + prevsamp2)/3;
+        
+        EVMDM6437_AIC33_write16( aic33handle, currsamp );      
+        audio_buffer[ind_i] = currsamp;
+        prevsamp2 = prevsamp;
+        prevsamp = currsamp;
+ 
+    } 
+
+    return;   
+}
+
+
+// Copy data from input buffer to output buffer
+void Copy(void){
+	//Int32 i, j;
+	Uint32 temp;
+	
+//declare some stupid constants here
+	int i, j, ind;
+	int matrix11; //covariance matrix with 11,12(21)and 22
+	int matrix12;
+	int matrix22;
+	matrix11 = 600;
+	matrix12 = 708;
+	matrix22 = 995;
+	int b;
+	b = 112;
+	//.3835;
+	int r;
+	r = 147;
+	//.3064;
+
+	int vW;
+	vW = vWidth/2; //ROW in matlab
+	int vH;
+	vH = vHeight; //COL
+	int PoC;
+	int PoM;
+	int Tb;
+	int Tr;	
+	int TB;
+	int TR;
+	int temp1;
+	int temp2;
+	int temp3;
+	int TBO; //TB Old
+	int TRO;
+	int YZ; //Y zero
+	int YZO;
+	int YO; //Y one
+	int YOO;	
+	int Dtb; //difference of blue between the two frames
+	int Dtr;
+	int Dyo;
+	int Dyz;
+	int handLX;
+	int handLY;
+	int handRX;
+	int handRY;
+	short LEFT = 1;
+	short RIGHT = 1;
+	int handLPX;
+	int handLPY;
+	int handRPX;
+	int handRPY;	
+	int X = 0;
+	int Y = 0;
+	int Number= 0;
+	int output; //dependent on prevhit
+	int outputR;
+	int MeanXR = 0;
+	int MeanYR = 0;
+	int MeanXL = 0;
+	int MeanYL = 0;
+	int VarianceX;
+	int VarianceY;
+
+	for(i=0; i<vH; ++i){
+		for (j=0; j<vW; ++j) {
+			ind = i * vW + j;
+			TB = 0x000000FF & (buffer_in[ind]);
+			TBO = 0x000000FF & (buffer_out[ind]);
+			YO = (0xFF000000 & (buffer_in[ind])) >> 24;
+			YOO = (0xFF000000 & (buffer_out[ind])) >> 24;
+			TR = (0x00FF0000 & (buffer_in[ind])) >> 16;
+			TRO = (0x00FF0000 & (buffer_out[ind])) >> 16;
+			YZ = (0x0000FF00 & (buffer_in[ind])) >> 8;
+			YZO = (0x0000FF00 & (buffer_out[ind])) >> 8;
+
+			Tb = TB - b; //this is for the differnece between the blue and the average blue. for color detection
+			Tr = TR - r;
+
+			Dtb = TB - TBO; //this is for movement detection
+			Dtr = TR - TRO;
+			Dyz = YZ - YZO;
+			Dyo = YO - YOO;
+			
+			int product;
+			product = abs(Dtb*Dtr);
+
+			temp1 = Tb*matrix11 + Tr*matrix12;
+			temp2 = Tb*matrix12 + Tr*matrix22;
+			temp3 = (int)(-(Tb*temp1 + Tr*temp2)/2);
+			PoC = temp3 + 26000;
+			PoM = product*PoC + product*5000;
+
+			if(PoM>1600000){
+				blah[ind] = 0;
+				//printf("\n green frame detected");
+			} else {
+				blah[ind] = 1;
+				
+			}			
+		}
+	}
+	
+
+// Kalman filtering
+		int row;
+		int column2;
+		int column;
+		//xt_tm1= F*Xt
+		int rowa=4;
+		int cola=4;
+		int colb=1;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=F[row][column]*Xt[column][column2];
+					sumR+=F[row][column]*XtR[column][column2];
+				}
+				xt_tm1[row][column2]=sum;
+				xt_tm1R[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+	
+		
+		//Pt_tm1= F*P
+		rowa=4;
+		cola=4;
+		colb=4;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=F[row][column]*P[column][column2];
+					sumR+=F[row][column]*PR[column][column2];
+				}
+				buffer[row][column2]=sum;
+				bufferR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		//Ftranspose
+		row=0;
+ 		column=0;
+		for (row=0; row<4; row++){
+			for(column=0;column<4;column++){
+					Ftranspose[row][column]=F[column][row];
+			}
+		}
+		
+		//(F*P)*transpose(F)
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=buffer[row][column]*Ftranspose[column][column2];
+					sumR+=bufferR[row][column]*Ftranspose[column][column2];
+				}
+				buffer2[row][column2]=sum;
+				buffer2R[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//(F*P)*transpose(F)+Q
+		for(row=0; row<4; row++){
+			for(column=0; column<4; column++){
+				Pt_tm1[row][column]=buffer2[row][column]+Q[row][column];
+				Pt_tm1R[row][column]=buffer2R[row][column]+QR[row][column];
+			}
+		}
+		
+		//printf("Prediction vector xt_tm1  is %f, %f, %f, %f \n", Pt_tm1[0][0], Pt_tm1[1][0], Pt_tm1[2][0], Pt_tm1[3][0]);
+		//printf("Prediction vector xt_tm1R is %f, %f, %f, %f \n \n", Pt_tm1R[0][0], Pt_tm1R[1][0], Pt_tm1R[2][0], Pt_tm1R[3][0]);
+		
+		//Measurement update
+		//z1[0][0]=readx;
+		//z1[1][0]=ready;
+
+
+		
+		//Measurement Prediction(H*xt_tm1)
+		rowa=2;
+		cola=4;
+		colb=1;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=H[row][column]*xt_tm1[column][column2];
+					sumR+=H[row][column]*xt_tm1R[column][column2];
+				}
+				zt[row][column2]=sum;
+				ztR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		
+		
+	//printf("Prediction vector XtR  is %f, %f, %f, %f \n", XtR[0][0], XtR[1][0], XtR[2][0], XtR[3][0]);
+	//printf("Prediction vector xt_tm1R is %f, %f, %f, %f \n \n", xt_tm1R[0][0], xt_tm1R[1][0], xt_tm1R[2][0], xt_tm1R[3][0]);
+	
+	handLPX=zt[0][0];
+	handLPY=zt[1][0];
+	handRPX=ztR[0][0];
+	handRPY=ztR[1][0];
+	//printf(" LPX LPY  %d %d \n", handLPX, handLPY);
+	//printf(" RPX RPY  %d %d \n \n", handRPX, handRPY);
+	
+	/*if ((previousyspeed-xt_tm1[3][0])>-3){
+		hit=1;	
+	}
+	//down is positive speed
+	//printf("Y speed is %f \n", xt_tm1[3][0]);
+	//printf("\n");
+	prevhit3 = prevhit2;
+	prevhit2 = prevhit;
+	
+	
+	if (hit && prevhit==0 && prevhit2 == 0 && prevhit3 == 0){
+		//&& prevhit2 == 0 && prevhit3 == 0
+		output=16711680;
+		prevhit=1;	
+		synthesize_drum(0.99,250);
+	}
+	else{
+		output=3532837384;
+		prevhit=0;
+	}*/
+
+	
+	/*for(i=0; i<vH; ++i){
+		for (j=0; j<vW/2; ++j) {
+			ind = i * vW + j;
+			if((i>(handLPY-20) && i < (handLPY+20))&&(j>(handLPX-20) && j < (handLPX+20))){
+				 buffer_out[ind] = output;
+			}else{
+				buffer_out[ind] = buffer_out[ind];
+			}
+		}
+	}*/
+	
+	
+
+	for(i=0; i<vH; ++i){
+		for (j=0; j<vW/2; ++j) {
+			ind = i * vW + j;
+			if(blah[ind] == 0){
+				X = X+j;
+				Y = Y+i;
+				//XS += j^2;
+				//YS += i^2;
+				Number++;
+			}
+		}
+	}
+	
+	//printf("\n number of green left frames %d", Number);
+	
+	if(Number<250){ //250
+		LEFT = 1;
+	}
+	else{
+	LEFT = 0;
+	MeanXL = X/Number;
+	//printf("\nMeanX Left %d", MeanX);
+	MeanYL = Y/Number;
+	//printf("\nMeanY Left %d", MeanY);
+	//VarianceX = XS/Number - MeanXL^2;
+	//VarianceY = YS/Number - MeanYL^2;
+	handLX = MeanXL;
+	handLY = MeanYL;
+	/*for(i=0; i<vH; ++i){
+		for (j=0; j<vW/2; ++j) {
+			ind = i * vW + j;
+			if((i>(MeanYL-20) && i < (MeanYL+20))&&(j>(MeanXL-20) && j < (MeanXL+20))){
+				 buffer_out[ind] = 255;
+			}
+			else{
+				buffer_out[ind] = buffer_out[ind];
+			}
+		}
+	}*/
+	}
+	
+
+	X = 0;
+	Y = 0;
+	//XS = 0;
+	//YS = 0;
+	Number = 0;
+	
+	for(i=0; i<vH; ++i){
+		for (j=vW/2; j<vW; ++j) {
+			ind = i * vW + j;
+			if(blah[ind] == 0){
+				X = X+j;
+				Y = Y+i;
+				//XS += j^2;
+				//YS += i^2;
+				Number++;
+			}
+		}
+	}
+	
+	if(Number<250){
+		RIGHT = 1;
+	}
+	else{
+	RIGHT = 0;
+	MeanXR = X/Number;
+	MeanYR = Y/Number;
+	//printf("\nMeanX Right %d", MeanX);
+	//printf("\nMeanY Right %d", MeanY);
+	//VarianceX = XS/Number - MeanXR^2;
+	//VarianceY = YS/Number - MeanYR^2;
+	handRX = MeanXR;
+	handRY = MeanYR;
+	/*for(i=0; i<vH; ++i){
+		for (j=vW/2; j<vW; ++j) {
+			ind = i * vW + j;
+			if((i>(MeanYR-20) && i < (MeanYR+20))&&(j>(MeanXR-20) && j < (MeanXR+20))){
+				b[ind] = 255;
+			}
+		}
+	}*/
+
+	}
+		
+		//Measurement update
+		if(!RIGHT){
+			z1R[0][0]=handRX;
+			z1R[1][0]=handRY;
+			if(NewR==0||countR<1){
+				NewR=2;	
+				countR++;
+			}
+			else{
+				NewR=1;
+			}
+		}
+		else{
+			NewR=0;	
+			countR=0;
+		}
+
+		if(!LEFT){
+			z1[0][0]=handLX;
+			z1[1][0]=handLY;
+			if(NewL==0||countL<1){
+				NewL=2;	
+				countL++;
+			}
+			else{
+				NewL=1;	
+			}
+		}
+		else{
+			NewL=0;	
+			countL=0;
+		}
+
+		
+		//printf("handLPY %d \n", handLY);
+		//printf("handRY %d \n", handRY);
+		//Residual
+		for(row=0; row<2; row++){
+			for(column=0; column<2; column++){
+				Resy[row][column]=z1[row][column]-zt[row][column];
+				ResyR[row][column]=z1R[row][column]-ztR[row][column];
+			}
+		}
+		
+		
+
+		//Residual Covariance Part of eqn#1
+		//(H*Pt_tm1)=buffer
+		
+		rowa=2;
+		cola=4;
+		colb=4;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=H[row][column]*Pt_tm1[column][column2];
+					sumR+=H[row][column]*Pt_tm1R[column][column2];
+				}
+				buffer[row][column2]=sum;
+				bufferR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//(H*Pt_tm1)*transpose(H)
+		rowa=2;
+		cola=4;
+		colb=2;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=buffer[row][column]*Htranspose[column][column2];
+					sumR+=bufferR[row][column]*Htranspose[column][column2];
+				}
+				buffer2[row][column2]=sum;
+				buffer2R[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//S=H*Pt_tm1)*transpose(H)+R
+		for(row=0; row<2; row++){
+			for(column=0; column<2; column++){
+				S[row][column]=buffer2[row][column]+R[row][column];
+				SR[row][column]=buffer2R[row][column]+R[row][column];
+			}
+		}
+		
+		//Calculation of Kalman Gain
+		//(Pt_tm1*transpose(H))
+		
+		rowa=4;
+		cola=4;
+		colb=2;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=Pt_tm1[row][column]*Htranspose[column][column2];
+					sumR+=Pt_tm1R[row][column]*Htranspose[column][column2];
+				}
+				buffer[row][column2]=sum;
+				bufferR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//Calculation of S inverse
+		float inverseS[2][2]; //{{S[1][1], -1*S[0][1]}, {-1*S[1][0], S[0][0]}};
+		float inverseSR[2][2];
+		inverseS[0][0]=S[1][1];
+		inverseSR[0][0]=SR[1][1];
+		inverseS[0][1]=-1*S[0][1];
+		inverseSR[0][1]=-1*SR[0][1];
+		inverseS[1][0]=-1*S[1][0];
+		inverseSR[1][0]=-1*SR[1][0];
+		inverseS[1][1]=S[0][0];
+		inverseSR[1][1]=SR[0][0];
+		for(row=0; row<2; row++){
+			for(column=0; column<2; column++){
+				inverseS[row][column]=inverseS[row][column]/(S[0][0]*S[1][1]-S[1][0]*S[1][0]);
+				inverseSR[row][column]=inverseSR[row][column]/(SR[0][0]*SR[1][1]-SR[1][0]*SR[1][0]);
+			}
+		}
+		
+		//K=(Pt_tm1*transpose(H))*S-1
+		rowa=4;
+		cola=2;
+		colb=2;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=buffer[row][column]*inverseS[column][column2];
+					sumR+=bufferR[row][column]*inverseSR[column][column2];
+				}
+				K[row][column2]=sum;
+				KR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//Xt calculation
+		//K*Resy
+		rowa=4;
+		cola=2;
+		colb=1;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=K[row][column]*Resy[column][column2];
+					sumR+=KR[row][column]*ResyR[column][column2];
+				}
+				buffer[row][column2]=sum;
+				bufferR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//Xt=xt_tm1+K*Resy
+		for(row=0; row<4; row++){
+			for(column=0; column<1; column++){
+				Xt[row][column]=buffer[row][column]+xt_tm1[row][column];
+				XtR[row][column]=bufferR[row][column]+xt_tm1R[row][column];
+			}
+		}
+		
+		
+		
+		
+		//Calculation of new P
+		//K*H
+		rowa=4;
+		cola=2;
+		colb=4;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=K[row][column]*H[column][column2];
+					sumR+=KR[row][column]*H[column][column2];
+				}
+				buffer[row][column2]=sum;
+				bufferR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		//eye-K*H
+		for(row=0; row<4; row++){
+			for(column=0; column<4; column++){
+				buffer2[row][column]=eye[row][column]-buffer[row][column];
+				buffer2R[row][column]=eye[row][column]-bufferR[row][column];
+			}
+		}
+		
+		//P=(eye-K*H)*Pt_tm1
+		rowa=4;
+		cola=4;
+		colb=4;
+		for(row=0; row<rowa; row++){
+			for(column2=0; column2<colb; column2++){
+				for(column=0; column<cola; column++){
+					sum+=buffer2[row][column]*Pt_tm1[column][column2];
+					sumR+=buffer2R[row][column]*Pt_tm1R[column][column2];
+				}
+				P[row][column2]=sum;
+				PR[row][column2]=sumR;
+				sum=0;
+				sumR=0;
+			}
+		}
+		
+		
+		//rowa=4;
+		//colb=4;
+		//for(row=0; row<rowa; row++){
+		//	for(column=0; column<colb; column++){
+		//		//float write=xt_tm1[row][column];
+		//		printf("%f ", P[row][column]);
+		//	}
+		//	printf("\n");
+		//}
+
+
+		
+
+		//if(i==2){
+		//		break;
+		//}
+
+	previousyspeed=currentyspeed;
+	previousyspeedR=currentyspeedR;
+	currentyspeed=Xt[3][0];
+	currentyspeedR=XtR[3][0];
+
+	hit=0;
+	hitR=0;
+
+    // left hand hit detected
+	if (((previousyspeed-currentyspeed)>30) && (previousyspeed*currentyspeed<0)&&NewL==1){
+		hit=1;
+		synthesize_drum(alpha_in, delay_in, gainL);
+	}
+	
+    // right hand hit detected
+	if (((previousyspeedR-currentyspeedR)>30) && (previousyspeedR*currentyspeedR<0)&&NewR==1){
+		hitR=1;
+		if (hit==1) { // if both left and right hits are detected - louder sound
+			synthesize_drum(alpha_in, delay_in, gainR+gainL+1000);
+		} else { // if just right hit is detected
+			synthesize_drum(alpha_in, delay_in, gainR);
+		}
+	}
+	
+	//printf("Prediction vector is %f, %f, %f, %f \n", Xt[0][0], Xt[1][0], Xt[2][0], Xt[3][0]);
+	//printf("Prediction vector R is %f, %f, %f, %f \n \n", XtR[0][0], XtR[1][0], XtR[2][0], XtR[3][0]);
+	//printf("current L Y speed is %f \n", currentyspeed);
+	//printf("current R Y speed is %f \n \n", currentyspeedR);
+
+	//down is positive speed
+	//printf("Y speed is %f \n", xt_tm1[3][0]);
+	//printf("\n");
+	if (hitR && !prevhit2R && !prevhit3R){
+		actualhit=1;
+		outputR=16711680;
+		actualhit=0;	
+	}
+	else{
+		outputR=3532837384;
+	}
+	
+	
+	if (hit && !prevhit2 && !prevhit3){
+		actualhit=1;
+		output=16711680;
+		actualhit=0;	
+	}
+	else{
+		output=3532837384;
+	}
+	
+	prevhit3 = prevhit2;
+	prevhit3R= prevhit2R;
+	prevhit2=hit;
+	prevhit2R=hitR;
+
+
+	//outputting to buffer_out
+	for(i=0; i<vH; ++i){
+		for (j=0; j<vW; ++j) {
+			ind = i * vW + j;
+			if((i>(MeanYL-5) && i < (MeanYL+5))&&(j>(MeanXL-5) && j < (MeanXL+5)) && LEFT == 0){
+				 buffer_out[ind] = 255;
+			} else if((i>(MeanYR-5) && i < (MeanYR+5))&&(j>(MeanXR-5) && j < (MeanXR+5)) && RIGHT  == 0){
+				 buffer_out[ind] = 255;
+			} else if((i>(handLPY-5) && i < (handLPY+5))&&(j>(handLPX-5) && j < (handLPX+5))){
+				 buffer_out[ind] = output;
+			} else if((i>(handRPY-5) && i < (handRPY+5))&&(j>(handRPX-5) && j < (handRPX+5))){
+				 buffer_out[ind] = outputR;
+			} else {
+				 buffer_out[ind] = buffer_in[ind];
+			}
+		}
+	}
+}//end of copy function
+
+
+// Direct copy data from input buffer to output buffer; both on the external memories
+// We did NOT use EDMA here
+void Copy2(void){
+	int i, j;
+	
+	// Copy data from input buffer to output buffer and 
+	// draw green square box at the center of view
+	for(i=0; i<vHeight; ++i)
+		for (j=0; j<vWidth/2; ++j) {
+			buffer_out[i * vWidth/2 + j] = buffer_in[i * vWidth/2 + j];
+			if ( i >= 220 && i < 260 && j >= 170 && j < 190 )
+				if( rand()%2 == 0 ) {
+					buffer_out[i * vWidth/2 + j] = 0;
+				} else {
+					buffer_out[i*vWidth/2 + j] = 255;
+				}
+		}
+	
+	// Use block-based processing inside internal memory to speed up
+	// Demo code for block seperation: BufferNum blocks along row direction
+
+}
+
+// Flip vertically the image
+// Same as that in the first template
+void Inv(void){
+	int i, j;
+	unsigned int temp;
+
+	i = 0;
+	j = Pixels-Pixels / vHeight;
+
+	do{
+		temp = buffer_in[j];
+		buffer_out[i] = temp;
+		i++;
+		j++;
+
+		if(i%(Pixels / vHeight)==0){j = Pixels - i - Pixels / vHeight;}
+	} while (i < Pixels);
+}
+
+
+void main(void)
+{
+    Uint16 a=0;
+  	
+  	EVMDM6437_init( );
+  	
+  	CSR=0x100;		/* disable all interrup
+  	
+  	
+  	ts            */
+  	IER=1;			/* disable all interrupts except NMI */
+  	ICR=0xffff;		/* clear all pending interrupts      */   
+  	
+	ISTP = 0x10800400; // pointer to the address of interrupt service table (refer to link.cmd)
+	
+    MCBSP1_SPCR = 0x03130013; // SPCR
+    
+    INTC_EVTCLR0 = 0xFFFFFFFF; // Event Clear Register 0 (refer to spru871k)
+    INTC_EVTCLR1 = 0xFFFFFFFF; 
+    INTC_EVTCLR2 = 0xFFFFFFFF; 
+    INTC_EVTCLR3 =  0xFFFFFFFF;   
+   
+    INTC_EVTMASK3 = 0xFFFFFFFF; // Event Mask Register 3
+    INTC_EVTMASK2 = 0xFFFFFFFF;
+//   INTC_EVTMASK1 = 0xFFFFFFF7;   // 0xFFFF | 1111111111110111 b // 51 McBSP1 Receive
+    INTC_EVTMASK1 = 0xFFFFFFFB;     // 0xFFFF | 1111111111111011 b // 50 McBSP1 Transmit
+    INTC_EVTMASK0 = 0xFFFFFFFF; 
+   
+    INTC_INTMUX3 = 0x00320000; // Interrupt Mux Register 3, 50 McBSP1 Transmit
+//   INTC_INTMUX3 = 0x00330000; // Interrupt Mux Register 3, 51 McBSP1 Receive
+   
+    IER |= 0x00004002; // Enable Interrupt 14
+   
+    CSR=0x01 ;		/* enable all interrupts            */
+   
+    /* Initialize the DIP Switches & LEDs if needed */
+    EVMDM6437_LED_init( );
+    EVMDM6437_DIP_init( );
+   
+    video_loopback_test();   
+   
+    /* Grab AIC33 handle */
+    aic33handle = 0;
+   
+    FillMatrices();
+   
+    while(1)
+    {  
+	   //DirectTransferEDMA();
+       //BlockProcessingEDMA();
+	   Copy();
+	   
+   	   /* Get DIP switch input */
+       /* Will return DIP_DOWN or DIP_UP */
+       dip0 = EVMDM6437_DIP_get( DIP_0 );
+       dip1 = EVMDM6437_DIP_get( DIP_1 );
+        
+       // Run different procedures depending on the DIP switches pressed.
+       if ( dip0 == DIP_DOWN ) {
+       	   // synthesize_drum(alpha_in, delay_in);
+       	   
+           if (curDip != DIP_0) { // Play 1KHz sign wave
+           	   curDip = DIP_0;
+           	   if (aic33handle) EVMDM6437_AIC33_closeCodec( aic33handle );
+               aic33handle = EVMDM6437_AIC33_openCodec( AIC33_MCBSP_ID, &aic33config_lineout );
+               
+		   EVMDM6437_AIC33_write16( aic33handle, sinetable[playCnt]);               
+           }
+           
+       }
+       else if ( dip1 == DIP_DOWN ) {
+           if (curDip != DIP_1) { // audio loopback from line-in input
+           	   curDip = DIP_1;
+           	   if (aic33handle) EVMDM6437_AIC33_closeCodec( aic33handle );
+               aic33handle = EVMDM6437_AIC33_openCodec( AIC33_MCBSP_ID, &aic33config_linein_loopback );
+               
+           EVMDM6437_AIC33_read32( aic33handle, &sample_data );
+           EVMDM6437_AIC33_write32( aic33handle, sample_data );
+               
+           }
+           
+       }
+       else if (dip0&dip1== DIP_UP ){
+           if (aic33handle) EVMDM6437_AIC33_closeCodec( aic33handle );
+           aic33handle = 0;
+           curDip = 10; // reset
+       } 	   
+            	
+   }
+   
+   if (aic33handle) EVMDM6437_AIC33_closeCodec( aic33handle );
+}
+
+   
+/*********************************
+ * Interrupt Service Routine
+ * *******************************/
+interrupt void extint14_isr(void)
+{
+
+  /* flag = 1;
+  // printf("Interrupt\n");
+  
+  if (playReady) {
+  	  printf("Drum sound\n");
+	  synthesize_drum(alpha_in, delay_in);
+	  playReady = 0;
+  }
+  
+  /*if (curDip == DIP_0) { // Play 1KHz sign wave
+	  EVMDM6437_AIC33_write16( aic33handle, sinetable[playCnt]);
+      playCnt++;
+	  playCnt = playCnt % 48;
+  }*/
+
+  return;
+}
